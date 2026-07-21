@@ -1,0 +1,218 @@
+diff --git a/backend/src/usb_switch.rs b/backend/src/usb_switch.rs
+index a2b3fcd..0000000 100644
+--- a/backend/src/usb_switch.rs
++++ b/backend/src/usb_switch.rs
+@@ -39,5 +39,6 @@ use std::io::{self, Write};
+ use std::path::Path;
+ use std::process::Command;
++use std::time::Duration;
+ 
+ /// USB 模式配置
+ #[derive(Debug, Clone)]
+@@ -120,9 +121,13 @@ const AT_DEVICE_PATH: &str = "/dev/stty_lte30";
+ /// 默认 USB 网络接口 IP 地址
+ const USB_INTERFACE_IP: &str = "192.168.66.1";
+ const USB_INTERFACE_MAC: &str = "CC:E8:AC:C0:00:00";
++const USB_HOST_GATEWAY: &str = "192.168.66.2";
+ 
+ /// 默认 UDC 名称
+ const DEFAULT_UDC: &str = "29100000.dwc3";
++
++const NCM_USB2_MAX_DL_PKTS: u8 = 2;
++const DEFAULT_MAX_DL_PKTS: u8 = 7;
+ 
+ /// 写入文件的辅助函数
+ fn write_to_file(path: &str, content: &str) -> io::Result<()> {
+@@ -134,6 +140,72 @@ fn write_to_file(path: &str, content: &str) -> io::Result<()> {
+     Ok(())
+ }
+ 
++/// 等待 UDC 完成枚举，并读取实际协商速度。
++/// 常见值包括 high-speed（USB 2.0）和 super-speed（USB 3.x）。
++fn wait_for_udc_speed(udc_name: &str) -> Option<String> {
++    let speed_path = format!("/sys/class/udc/{}/current_speed", udc_name);
++
++    for _ in 0..20 {
++        if let Ok(speed) = fs::read_to_string(&speed_path) {
++            let speed = speed.trim().to_ascii_lowercase();
++            if !speed.is_empty() && speed != "unknown" {
++                return Some(speed);
++            }
++        }
++
++        std::thread::sleep(Duration::from_millis(250));
++    }
++
++    None
++}
++
++fn recommended_max_dl_pkts(config: &UsbModeConfig, speed: Option<&str>) -> u8 {
++    if config.configuration == "ncm"
++        && !matches!(speed, Some(value) if value.contains("super"))
++    {
++        // USB 2.0 + NCM 降低下行聚合，减少 PAMU3 突发和流控压力。
++        NCM_USB2_MAX_DL_PKTS
++    } else {
++        DEFAULT_MAX_DL_PKTS
++    }
++}
++
++/// PAMU3 的 open/post_init 会重设 max_dl_pkts，因此必须在 UDC 枚举完成后调优。
++fn tune_usb_link_after_enumeration(config: &UsbModeConfig, udc_name: &str) {
++    let speed = wait_for_udc_speed(udc_name);
++    let max_dl_pkts = recommended_max_dl_pkts(config, speed.as_deref());
++
++    if config.pamu3_protocol.is_some() && Path::new(PAMU3_MAX_DL_PKTS_PATH).exists() {
++        if let Err(error) = write_to_file(PAMU3_MAX_DL_PKTS_PATH, &max_dl_pkts.to_string()) {
++            eprintln!("Warning: failed to tune PAMU3 max_dl_pkts: {}", error);
++        }
++    }
++
++    // 仅对 NCM 禁用设备侧 runtime suspend，ECM/RNDIS 保持原行为。
++    if config.configuration == "ncm" {
++        let power_control_paths = [
++            format!("/sys/class/udc/{}/device/power/control", udc_name),
++            "/sys/class/net/usb0/device/power/control".to_string(),
++        ];
++
++        for path in power_control_paths {
++            if Path::new(&path).exists() {
++                if let Err(error) = write_to_file(&path, "on") {
++                    eprintln!("Warning: failed to keep USB device awake via {}: {}", path, error);
++                }
++            }
++        }
++    }
++
++    let speed_name = speed.as_deref().unwrap_or("unknown");
++    let report = format!(
++        "mode={}\nspeed={}\nmax_dl_pkts={}\n",
++        config.configuration, speed_name, max_dl_pkts,
++    );
++    let _ = fs::write("/tmp/usb_link_tuning", &report);
++    eprintln!("USB link tuning: {}", report.replace('\n', ", "));
++}
++
+ /// 发送 AT 指令到 modem（直接写入设备）
+ /// 
+ /// 用于发送 USB 模式相关的 AT 指令，如 AT+SPASENGMD
+@@ -423,13 +501,12 @@ pub fn switch_usb_mode_advanced(mode: u8) -> Result<(), String> {
+         }
+     }
+     
+-    // 5. 设置 max_dl_pkts (下行包批量数)
+-    if Path::new(PAMU3_MAX_DL_PKTS_PATH).exists() {
+-        let _ = write_to_file(PAMU3_MAX_DL_PKTS_PATH, "7");
+-    }
++    // 5. max_dl_pkts 延后到 UDC 枚举与 PAMU3 post_init 完成后设置。
+     
+     // 6. 发送 AT 指令控制 USB 共享模式
+-    let _ = set_usb_share_mode(config.usb_share_enable);
++    if let Err(error) = set_usb_share_mode(config.usb_share_enable) {
++        eprintln!("Warning: failed to set USB share mode: {}", error);
++    }
+     
+     // 7. 确保 configfs 已挂载
+     let _ = Command::new("mount")
+@@ -536,7 +613,8 @@ pub fn switch_usb_mode_advanced(mode: u8) -> Result<(), String> {
+         .map_err(|e| format!("Failed to enable UDC: {}", e))?;
+     
+-    // 19. 等待 USB 设备被主机识别
+-    std::thread::sleep(std::time::Duration::from_millis(1000));
++    // 19. 等待 USB 设备被主机识别，并按实际协商速度调优 PAMU3。
++    std::thread::sleep(Duration::from_millis(250));
++    tune_usb_link_after_enumeration(&config, &udc_name_cached);
+     
+     // 20. 配置网络接口
+     configure_usb_network()?;
+@@ -641,5 +720,18 @@ fn configure_usb_network() -> Result<(), String> {
+-    // 等待接口出现
+-    std::thread::sleep(std::time::Duration::from_millis(500));
++    // macOS 重新枚举复合 USB 设备可能明显慢于 Windows。
++    // 先等待 usb0 真正出现，再运行 connmanctl，避免初始化命令被静默丢弃。
++    for retry in 0..40 {
++        if Path::new("/sys/class/net/usb0").exists() {
++            break;
++        }
++
++        if retry < 39 {
++            std::thread::sleep(Duration::from_millis(250));
++        }
++    }
++
++    if !Path::new("/sys/class/net/usb0").exists() {
++        return Err("USB network interface usb0 did not appear after 10 seconds".to_string());
++    }
+     
+     // 1. 配置 connman gadget tethering
+     // 先关闭再重新启用（避免 "Already enabled" 错误）
+@@ -713,9 +805,10 @@ fn configure_usb_network() -> Result<(), String> {
+         .args(["link", "set", "dev", "usb0", "up"])
+         .output();
+     
+-    // 添加默认路由（用于主机端访问）
++    // usb0 是 CPE 向主机提供网络的 LAN，不应把设备默认路由指回主机。
++    // 清理旧版本可能留下的错误路由；不存在时忽略错误。
+     let _ = Command::new("ip")
+-        .args(["route", "add", "default", "via", "192.168.66.2"])
++        .args(["route", "del", "default", "via", USB_HOST_GATEWAY])
+         .output();
+     
+     // 3. 关闭 sipa_usb0 接口（IPA USB 接口，避免冲突）
+@@ -733,5 +827,18 @@ fn configure_usb_network() -> Result<(), String> {
+         .args(["-c", "ifconfig > /dev/kmsg 2>/dev/null"])
+         .output();
++
++    // 验证关键地址确实已经生效；原实现即使命令失败也会返回 Ok。
++    let interface_state = Command::new("ifconfig")
++        .arg("usb0")
++        .output()
++        .map_err(|e| format!("Failed to verify usb0: {}", e))?;
++    let interface_text = String::from_utf8_lossy(&interface_state.stdout);
++    if !interface_state.status.success() || !interface_text.contains(USB_INTERFACE_IP) {
++        return Err(format!(
++            "usb0 does not have expected address {} after configuration",
++            USB_INTERFACE_IP,
++        ));
++    }
+     
+     Ok(())
+ }
+diff --git a/frontend/src/pages/Configuration.tsx b/frontend/src/pages/Configuration.tsx
+index 01c7d16..0000000 100644
+--- a/frontend/src/pages/Configuration.tsx
++++ b/frontend/src/pages/Configuration.tsx
+@@ -772,9 +772,9 @@ export default function ConfigurationPage() {
+                   control={<Radio />}
+                   label={
+                     <Box>
+-                      <Typography variant="body1">CDC-NCM (推荐)</Typography>
++                      <Typography variant="body1">CDC-NCM（USB 3.x / 性能优先）</Typography>
+                       <Typography variant="caption" color="text.secondary">
+-                        网络控制模型 - 性能最好，支持 Linux/macOS
++                        USB 3.x 下性能较好；USB 2.0 或部分 macOS 设备如掉线，请改用 CDC-ECM
+                       </Typography>
+                     </Box>
+                   }
+@@ -784,9 +784,9 @@ export default function ConfigurationPage() {
+                   control={<Radio />}
+                   label={
+                     <Box>
+-                      <Typography variant="body1">CDC-ECM</Typography>
++                      <Typography variant="body1">CDC-ECM（macOS / USB 2.0 推荐）</Typography>
+                       <Typography variant="caption" color="text.secondary">
+-                        以太网控制模型 - 兼容性好，适用于旧系统
++                        稳定性优先，适合 macOS、USB 2.0 和旧系统
+                       </Typography>
+                     </Box>
+                   }
+@@ -802,5 +802,9 @@ export default function ConfigurationPage() {
+                 />
+               </RadioGroup>
+             </FormControl>
++
++            <Alert severity="info" sx={{ mt: 2 }}>
++              Mac 或 USB 2.0 链路建议先选 CDC-ECM；确认协商到 5 Gb/s 后再测试 CDC-NCM。
++            </Alert>
+ 
+             <Divider sx={{ my: 2 }} />

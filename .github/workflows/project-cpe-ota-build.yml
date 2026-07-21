@@ -10,7 +10,7 @@ permissions:
 jobs:
   build-ota:
     name: Build patched UDX710 OTA
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 45
 
     steps:

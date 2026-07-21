@@ -10,7 +10,7 @@ permissions:
 jobs:
   build-ota:
     name: Build patched UDX710 OTA
-    runs-on: ubuntu-24.04-arm
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
 
     steps:
@@ -65,24 +65,26 @@ jobs:
           targets: aarch64-unknown-linux-musl
           components: rustfmt
 
-      - name: Install musl toolchain
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools file
-          musl-gcc --version
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
 
       - name: Format and build backend
         working-directory: project-cpe/backend
         env:
-          CC_AARCH64_UNKNOWN_LINUX_MUSL: musl-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
           SQLITE3_STATIC: '1'
           LIBSQLITE3_SYS_USE_PKG_CONFIG: '0'
           GIT_COMMIT: 9402522-macncm1
         run: |
           set -euo pipefail
           cargo fmt --all
-          cargo build --release --target aarch64-unknown-linux-musl
+          cargo zigbuild --release --target aarch64-unknown-linux-musl
           file target/aarch64-unknown-linux-musl/release/udx710
           file target/aarch64-unknown-linux-musl/release/udx710 | grep -q 'ARM aarch64'
 
